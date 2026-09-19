@@ -7,43 +7,87 @@ use Illuminate\Support\Facades\Log;
 
 class CertificateTransparencyService
 {
+    protected int $timeout = 10;
+
+    protected int $connectTimeout = 3;
+
     public function fetchDomains(string $domain): array
     {
-        // Clean domain (remove protocol or www if passed)
         $cleanDomain = parse_url($domain, PHP_URL_HOST) ?? $domain;
-        $cleanDomain = preg_replace('/^www\./', '', trim($cleanDomain));
 
-        // crt.sh JSON endpoint query
+        $cleanDomain = preg_replace(
+            '/^www\./',
+            '',
+            trim(strtolower($cleanDomain))
+        );
+
         $url = "https://crt.sh/?q=%25.{$cleanDomain}&output=json";
 
         try {
-            // Making HTTP request with a timeout
-            $response = Http::timeout(15)->get($url);
+            $response = Http::connectTimeout($this->connectTimeout)
+                ->timeout($this->timeout)
+                ->get($url);
 
-            if ($response->successful() && is_array($response->json())) {
-                $entries = $response->json();
-                $domains = [];
+            if (
+                !$response->successful() ||
+                !is_array($response->json())
+            ) {
+                return [];
+            }
 
-                foreach ($entries as $entry) {
-                    if (isset($entry['name_value'])) {
-                        // crt.sh sometimes returns multiple domains separated by newlines in one entry
-                        $names = explode("\n", $entry['name_value']);
-                        foreach ($names as $name) {
-                            $name = trim(strtolower($name));
-                            
-                            // Filter out wildcard domains (e.g., *.example.com) and keep valid hostnames
-                            if (!str_starts_with($name, '*') && filter_var($name, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)) {
-                                $domains[] = $name;
-                            }
-                        }
-                    }
+            $entries = $response->json();
+            $domains = [];
+
+            foreach ($entries as $entry) {
+                if (!isset($entry['name_value'])) {
+                    continue;
                 }
 
-                // Remove duplicates and re-index array
-                return array_values(array_unique($domains));
+                $names = explode(
+                    "\n",
+                    $entry['name_value']
+                );
+
+                foreach ($names as $name) {
+                    $name = trim(strtolower($name));
+
+                    if (
+                        str_starts_with($name, '*.')
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                        !filter_var(
+                            $name,
+                            FILTER_VALIDATE_DOMAIN,
+                            FILTER_FLAG_HOSTNAME
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    if (
+                        $name === $cleanDomain ||
+                        str_ends_with(
+                            $name,
+                            '.' . $cleanDomain
+                        )
+                    ) {
+                        $domains[] = $name;
+                    }
+                }
             }
-        } catch (\Exception $e) {
-            Log::error("crt.sh fetch failed for {$cleanDomain}: " . $e->getMessage());
+
+            return array_values(
+                array_unique($domains)
+            );
+
+        } catch (\Throwable $e) {
+            Log::error(
+                "crt.sh fetch failed for {$cleanDomain}: "
+                . $e->getMessage()
+            );
         }
 
         return [];

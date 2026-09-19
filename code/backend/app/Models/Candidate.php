@@ -10,7 +10,14 @@ class Candidate extends Model
     protected $fillable = [
         'scan_id',
         'variation_domain',
-        'security_score',
+        'ownership_score',
+        'ownership_classification',
+        'ownership_reasons',
+    ];
+
+    protected $casts = [
+        'ownership_score' => 'integer',
+        'ownership_reasons' => 'array',
     ];
 
     public function scan(): BelongsTo

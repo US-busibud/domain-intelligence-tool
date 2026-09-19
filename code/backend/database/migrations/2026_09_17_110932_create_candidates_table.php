@@ -15,7 +15,6 @@ return new class extends Migration
             $table->id();
             $table->foreignId('scan_id')->constrained()->onDelete('cascade'); // Link to scans table
             $table->string('variation_domain'); // Generated domain (e.g., getacme.com)
-            $table->integer('security_score')->nullable(); // Score calc ke liye
             $table->timestamps();
         });
     }

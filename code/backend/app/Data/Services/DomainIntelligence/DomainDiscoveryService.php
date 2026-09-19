@@ -3,16 +3,10 @@
 namespace App\Data\Services\DomainIntelligence;
 
 use App\Models\Scan;
+use Illuminate\Support\Facades\Log;
 
-/**
- * Service responsible for orchestrating the entire domain discovery process.
- * It coordinates normalization, generation, DNS verification, and HTTP liveness checks.
- */
 class DomainDiscoveryService
 {
-    /**
-     * Injecting all required sub-services through the constructor.
-     */
     public function __construct(
         protected DomainNormalizerService $normalizer,
         protected BrandExtractorService $extractor,
@@ -20,130 +14,406 @@ class DomainDiscoveryService
         protected CertificateTransparencyService $crtService,
         protected DnsAnalysisService $dnsService,
         protected HttpLivenessService $httpService,
-        // protected RedirectAnalysisService $redirectService,
         protected EmailInfrastructureService $emailService,
-        protected WebsiteEvidenceService $evidenceService
+        protected WebsiteEvidenceService $evidenceService,
+        protected OwnershipScoringService $ownershipScoringService
     ) {}
 
-    /**
-     * Execute the main discovery pipeline for a given input domain.
-     *
-     * @param string $inputDomain The raw domain input from the user (e.g., 'https://acme.com')
-     * @return Scan The complete scan record with dynamically attached candidate test results
-     */
     public function discover(string $inputDomain): Scan
     {
-        // Step 1: Clean the input (e.g., remove http://, www., and trailing slashes)
-        $normalizedDomain = $this->normalizer->normalize($inputDomain);
-        
-        // Step 2: Extract the core brand name for generating variations
-        $brand = $this->extractor->extract($normalizedDomain);
-        
-        // Step 3: Fetch known subdomains/domains from Certificate Transparency (CT) logs
-        $realDomains = $this->crtService->fetchDomains($normalizedDomain);
-        
-        // Step 4: Generate hypothetical domain variations based on the brand name
-        $generatedCandidates = $this->generator->generate($brand);
-        
-        // Step 5: Merge both lists and remove any duplicates to optimize scanning
-        $allCandidates = array_unique(array_merge($realDomains, $generatedCandidates));
-        
-        // Step 6: Filter out dead domains early using lightweight DNS resolution
-        // This prevents wasting time sending HTTP requests to non-existent servers
-        $verifiedDomains = $this->dnsService->filterValidDomains($allCandidates);
+        $totalStart = microtime(true);
+        $timings = [];
 
-        // Step 7: Ensure the original requested domain is included if it resolves correctly
-        if (!in_array($normalizedDomain, $verifiedDomains) && $this->dnsService->verifyDomain($normalizedDomain)) {
-            $verifiedDomains[] = $normalizedDomain;
+        $start = microtime(true);
+
+        $normalizedDomain = $this->normalizer->normalize($inputDomain);
+
+        $timings['normalize'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
+        $brand = $this->extractor->extract($normalizedDomain);
+
+        $timings['brand_extraction'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
+        $realDomains = $this->crtService->fetchDomains(
+            $normalizedDomain
+        );
+
+        $timings['certificate_transparency'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
+        $generatedCandidates = $this->generator->generate($brand);
+
+        $timings['candidate_generation'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
+        $allCandidates = array_values(array_unique(array_merge(
+            $realDomains,
+            $generatedCandidates
+        )));
+
+        $allCandidates = array_values(array_filter(
+            $allCandidates,
+            fn ($domain) => $domain !== $normalizedDomain
+        ));
+
+        $timings['candidate_merge'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
+        $dnsResults = $this->dnsService->analyzeMany(
+            $allCandidates
+        );
+
+        $timings['dns_analysis'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $verifiedDomains = [];
+
+        foreach ($dnsResults as $domain => $dnsData) {
+            if ($dnsData['has_dns']) {
+                $verifiedDomains[] = $domain;
+            }
         }
 
-        // Step 8: Initialize the main Scan record in the database
+        $timings['candidate_count'] = count($allCandidates);
+        $timings['verified_domain_count'] = count($verifiedDomains);
+
+        $start = microtime(true);
+
         $scan = Scan::create([
             'original_input' => $inputDomain,
             'normalized_domain' => $normalizedDomain,
             'brand_name' => $brand,
         ]);
 
+        $timings['scan_create'] = round(
+            microtime(true) - $start,
+            3
+        );
+
         $candidateRecords = [];
         $testResults = [];
 
-        // Step 9: Perform deep analysis (HTTP/HTTPS & Redirects) on each verified domain
+        $start = microtime(true);
+
+        $livenessResults = $this->httpService->checkMany(
+            $verifiedDomains
+        );
+
+        $timings['http_analysis'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $primaryLivenessData = $livenessResults[$normalizedDomain] ?? [
+            'is_alive' => false,
+            'status_code' => null,
+            'redirect_url' => null,
+            'page_title' => null,
+            'page_text' => null,
+            'page_links' => [],
+            'url' => null,
+        ];
+
+        $primaryPageLinks =
+            $primaryLivenessData['page_links'] ?? [];
+
+        $start = microtime(true);
+
+        $emailResults = $this->emailService->analyzeMany(
+            $verifiedDomains
+        );
+
+        $timings['email_analysis'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
         foreach ($verifiedDomains as $domain) {
-            
-            // Perform HTTP Liveness check (fetches status code, page title, text, and links)
-            $livenessData = $this->httpService->check($domain);
-            
-            // Initialize default redirect data assuming no redirect exists
-            $redirectData = [
-                'has_redirect' => $livenessData['has_redirect'] ?? false,
-                'redirect_url' => $livenessData['redirect_url'] ?? null,
+            $livenessData = $livenessResults[$domain] ?? [
+                'is_alive' => false,
+                'status_code' => null,
+                'redirect_url' => null,
+                'page_title' => null,
+                'page_text' => null,
+                'page_links' => [],
+                'url' => null,
             ];
 
-            // If the domain's web server is reachable, check if it redirects elsewhere
-            // if ($livenessData['is_alive']) {
-            //     $redirectData = $this->redirectService->analyze($livenessData['url']);
-            // }
+            $redirectData = [
+                'has_redirect' =>
+                    $livenessData['has_redirect'] ?? false,
+                'redirect_url' =>
+                    $livenessData['redirect_url'] ?? null,
+            ];
 
-            // Run the Email Infrastructure Check
-            $emailData = $this->emailService->analyze($domain);
+            $emailData = $emailResults[$domain] ?? [
+                'has_mx' => false,
+                'has_spf' => false,
+                'has_dmarc' => false,
+                'has_dkim' => false,
+                'dkim_selectors' => [],
+            ];
 
             $candidateDataForEvidence = [
-                'page_title'   => $livenessData['page_title'] ?? null,
-                'page_text'    => $livenessData['page_text'] ?? null,
-                'page_links'   => $livenessData['page_links'] ?? [],
-                'redirects_to' => $redirectData['redirect_url'],
-            ];
-            $evidenceData = $this->evidenceService->analyze($brand, $normalizedDomain, $candidateDataForEvidence);
+                'candidate_domain' => $domain,
 
-            // Prepare the basic candidate database record (excluding heavy HTTP data for now)
+                'page_title' =>
+                    $livenessData['page_title'] ?? null,
+
+                'page_text' =>
+                    $livenessData['page_text'] ?? null,
+
+                'page_links' =>
+                    $livenessData['page_links'] ?? [],
+
+                'redirects_to' =>
+                    $redirectData['redirect_url'],
+
+                'primary_page_links' =>
+                    $primaryPageLinks,
+            ];
+
+            $evidenceData = $this->evidenceService->analyze(
+                $brand,
+                $normalizedDomain,
+                $candidateDataForEvidence
+            );
+
+            $hasEmailInfrastructure =
+                $emailData['has_mx'] ||
+                $emailData['has_spf'] ||
+                $emailData['has_dmarc'] ||
+                $emailData['has_dkim'];
+
+            $usesHttps =
+                !empty($livenessData['url']) &&
+                str_starts_with(
+                    strtolower($livenessData['url']),
+                    'https://'
+                );
+
+            $ownershipEvidence = [
+                'is_alive' =>
+                    $livenessData['is_alive'] ?? false,
+
+                'uses_https' =>
+                    $usesHttps,
+
+                'mentions_brand' =>
+                    $evidenceData['mentions_brand'],
+
+                'brand_domain_match' =>
+                    $evidenceData['brand_domain_match'],
+
+                'links_to_primary' =>
+                    $evidenceData['links_to_primary'],
+
+                'redirects_to_primary' =>
+                    $evidenceData['redirects_to_primary'],
+
+                'primary_links_to_candidate' =>
+                    $evidenceData['primary_links_to_candidate'],
+
+                'has_email_infrastructure' =>
+                    $hasEmailInfrastructure,
+
+                'is_parked' =>
+                    $evidenceData['is_parked'],
+            ];
+
+            $ownershipResult =
+                $this->ownershipScoringService->calculate(
+                    $domain,
+                    $normalizedDomain,
+                    $ownershipEvidence
+                );
+
             $candidateRecords[] = [
                 'variation_domain' => $domain,
-                'security_score' => abs(crc32($domain) % 70) + 30, // Temporary placeholder scoring logic
+                'ownership_score' =>
+                    $ownershipResult['score'],
+                'ownership_classification' =>
+                    $ownershipResult['classification'],
+                'ownership_reasons' =>
+                    $ownershipResult['reasons'],
             ];
 
-            // Temporarily store the HTTP extraction results in memory 
-            // to attach them to the JSON response later
             $testResults[] = [
-                'is_alive'     => $livenessData['is_alive'],
-                'http_status'  => $livenessData['status_code'],
-                'redirects_to' => $redirectData['redirect_url'],
-                'page_title'   => $livenessData['page_title'] ?? null,
-                'page_text'    => $livenessData['page_text'] ?? null,
-                'page_links'   => $livenessData['page_links'] ?? [],
-                'has_mx'       => $emailData['has_mx'],
-                'has_spf'      => $emailData['has_spf'],
-                'has_dmarc'    => $emailData['has_dmarc'],
-                'mentions_brand'       => $evidenceData['mentions_brand'],
-                'links_to_primary'     => $evidenceData['links_to_primary'],
-                'redirects_to_primary' => $evidenceData['redirects_to_primary'],
+                'is_alive' =>
+                    $livenessData['is_alive'],
+
+                'http_status' =>
+                    $livenessData['status_code'],
+
+                'redirects_to' =>
+                    $redirectData['redirect_url'],
+
+                'page_title' =>
+                    $livenessData['page_title'] ?? null,
+
+                'page_text' =>
+                    $livenessData['page_text'] ?? null,
+
+                'page_links' =>
+                    $livenessData['page_links'] ?? [],
+
+                'has_mx' =>
+                    $emailData['has_mx'],
+
+                'has_spf' =>
+                    $emailData['has_spf'],
+
+                'has_dmarc' =>
+                    $emailData['has_dmarc'],
+
+                'has_dkim' =>
+                    $emailData['has_dkim'],
+
+                'dkim_selectors' =>
+                    $emailData['dkim_selectors'],
+
+                'mentions_brand' =>
+                    $evidenceData['mentions_brand'],
+
+                'links_to_primary' =>
+                    $evidenceData['links_to_primary'],
+
+                'redirects_to_primary' =>
+                    $evidenceData['redirects_to_primary'],
+
+                'primary_links_to_candidate' =>
+                    $evidenceData['primary_links_to_candidate'],
+
+                'is_parked' =>
+                    $evidenceData['is_parked'],
+
+                'parking_provider' =>
+                    $evidenceData['parking_provider'],
             ];
         }
 
-        // Step 10: Bulk insert the candidates into the database for performance
+        $timings['evidence_processing'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
         if (!empty($candidateRecords)) {
-            $scan->candidates()->createMany($candidateRecords);
+            $scan->candidates()->createMany(
+                $candidateRecords
+            );
         }
 
-        // Step 11: Reload the newly created candidate records from the database
+        $timings['candidate_insert'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
         $scan->load('candidates');
 
-        // Step 12: Attach the in-memory test results to the Eloquent models 
-        // This ensures the data is included in the final API JSON response 
-        // without permanently saving it to the database yet.
+        $timings['candidate_reload'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $start = microtime(true);
+
         foreach ($scan->candidates as $index => $candidate) {
-            $candidate->is_alive     = $testResults[$index]['is_alive'];
-            $candidate->http_status  = $testResults[$index]['http_status'];
-            $candidate->redirects_to = $testResults[$index]['redirects_to'];
-            $candidate->page_title   = $testResults[$index]['page_title'];
-            $candidate->page_text    = $testResults[$index]['page_text'];
-            $candidate->page_links   = $testResults[$index]['page_links'];
-            $candidate->has_mx       = $testResults[$index]['has_mx'];
-            $candidate->has_spf      = $testResults[$index]['has_spf'];
-            $candidate->has_dmarc    = $testResults[$index]['has_dmarc'];
-            $candidate->mentions_brand       = $testResults[$index]['mentions_brand'];
-            $candidate->links_to_primary     = $testResults[$index]['links_to_primary'];
-            $candidate->redirects_to_primary = $testResults[$index]['redirects_to_primary'];
+            $candidate->is_alive =
+                $testResults[$index]['is_alive'];
+
+            $candidate->http_status =
+                $testResults[$index]['http_status'];
+
+            $candidate->redirects_to =
+                $testResults[$index]['redirects_to'];
+
+            $candidate->page_title =
+                $testResults[$index]['page_title'];
+
+            $candidate->page_text =
+                $testResults[$index]['page_text'];
+
+            $candidate->page_links =
+                $testResults[$index]['page_links'];
+
+            $candidate->has_mx =
+                $testResults[$index]['has_mx'];
+
+            $candidate->has_spf =
+                $testResults[$index]['has_spf'];
+
+            $candidate->has_dmarc =
+                $testResults[$index]['has_dmarc'];
+
+            $candidate->has_dkim =
+                $testResults[$index]['has_dkim'];
+
+            $candidate->dkim_selectors =
+                $testResults[$index]['dkim_selectors'];
+
+            $candidate->mentions_brand =
+                $testResults[$index]['mentions_brand'];
+
+            $candidate->links_to_primary =
+                $testResults[$index]['links_to_primary'];
+
+            $candidate->redirects_to_primary =
+                $testResults[$index]['redirects_to_primary'];
+
+            $candidate->primary_links_to_candidate =
+                $testResults[$index]['primary_links_to_candidate'];
+
+            $candidate->is_parked =
+                $testResults[$index]['is_parked'];
+
+            $candidate->parking_provider =
+                $testResults[$index]['parking_provider'];
         }
+
+        $timings['result_attachment'] = round(
+            microtime(true) - $start,
+            3
+        );
+
+        $timings['total'] = round(
+            microtime(true) - $totalStart,
+            3
+        );
+
+        Log::info(
+            'Domain discovery performance',
+            $timings
+        );
 
         return $scan;
     }
